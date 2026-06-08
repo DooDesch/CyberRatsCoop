@@ -1,0 +1,44 @@
+# --- Third-party SDKs / tools (fetched by scripts/setup.ps1 / docs/build.md, not committed) ---
+# Keep: third_party/ue4ss/VERSION.txt (pin) and third_party/ue4ss/overrides/ (our custom AOB signature).
+third_party/ue4ss/_download/
+third_party/ue4ss/extracted/
+third_party/steamworks_sdk/*
+!third_party/steamworks_sdk/.gitkeep
+third_party/enet/*
+!third_party/enet/.gitkeep
+# Large reproducible deps — re-fetched + patched per docs/build.md (don't commit the trees/binaries):
+third_party/RE-UE4SS/
+third_party/xmake29/
+third_party/xmake293/
+
+# --- Generated / extracted game-derived artifacts (do NOT redistribute game content) ---
+mappings/*.usmap
+extracted/**
+*.pak
+*.ucas
+*.utoc
+*.uasset
+*.uexp
+*.umap
+
+# --- Build output ---
+build/
+out/
+bin/
+obj/
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
+mod/**/dlls/*.dll
+.xmake/
+.vs/
+CMakeFiles/
+CMakeCache.txt
+
+# --- Editor / OS ---
+.vscode/
+*.user
+Thumbs.db
+desktop.ini

@@ -1,0 +1,7 @@
+{
+    errdata = "C:\\Users\\denni\\AppData\\Local\\Temp\\.xmake\\260608\\_9fee020c707f17bfba08094eb14ea8d3.cpp:6:17: warning: expression result unused [-Wunused-value]\
+    6 |                 \"\\xef\\x84\\xa0\";\
+      |                 ^~~~~~~~~~~~~~\
+1 warning generated.\
+"
+}
