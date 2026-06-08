@@ -30,6 +30,11 @@
 #include <chrono>
 #include <mutex>
 #include <cmath>
+#include <vector>
+#include <array>
+#include <unordered_map>
+#include <set>
+#include <algorithm>
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -78,8 +83,8 @@ class CyberRatsCoopMod : public CppUserModBase {
 public:
     CyberRatsCoopMod() : CppUserModBase() {
         ModName = STR("CyberRatsCoop");
-        ModVersion = STR("0.2.0");
-        ModDescription = STR("2-player shared-maze co-op");
+        ModVersion = STR("0.4.0");
+        ModDescription = STR("2-player shared-maze co-op (M4: cheese/objective sync)");
         ModAuthors = STR("CyberRatsCoop");
     }
     ~CyberRatsCoopMod() override = default;
@@ -138,6 +143,15 @@ public:
             for (auto& fr : crc::parseFrames(p.data.data(), p.data.size(), &ok)) dispatch(fr);
         }
 
+        // Flush frames enqueued by game-thread hooks (cheese collects, seed share) — sent here so
+        // only this thread ever drives the socket / reliability layer.
+        {
+            std::vector<std::pair<bool, std::vector<uint8_t>>> out;
+            { std::lock_guard<std::mutex> lk(m_outMtx); out.swap(m_outFrames); }
+            for (auto& fr : out)
+                m_transport->send(fr.second.data(), fr.second.size(), fr.first, fr.first ? 0 : 2);
+        }
+
         // Outbound player state at ~20 Hz (snapshot filled by the game thread).
         uint64_t t = nowMs();
         if (m_peerReady && t - m_lastSend >= 50) {
@@ -185,6 +199,13 @@ private:
             Output::send<LogLevel::Default>(STR("[CRCoop] received maze seed {}\n"), (uint32_t)ms.seed);
             break;
         }
+        case Msg::PickupCollected: {
+            // Peer collected a cheese: queue it for the game thread to replay via Interact().
+            auto m = crc::PickupCollectedMsg::decode(fr.body);
+            std::lock_guard<std::mutex> lk(m_mtx);
+            m_pendingReplay.push_back(m.pickupId);
+            break;
+        }
         default: break;
         }
     }
@@ -193,13 +214,23 @@ private:
     void onProcessEvent(U::UObject* ctx, U::UFunction* fn, void*) {
         if (!ctx || !fn) return;
 
+        // Cheese collect is the hottest co-op event after player state. Once m_cheeseInteractFn is
+        // cached (post maze-gen), this is a single pointer-compare on the ProcessEvent fast path.
+        if (m_cheeseInteractFn && fn == m_cheeseInteractFn) {
+            auto* cheese = U::Cast<U::AActor>(ctx);
+            onCheeseInteract(cheese, cheese ? cheese->GetWorld() : nullptr);
+            return;
+        }
+
         // Lazily resolve target classes.
         if (!m_labRatClass)
             m_labRatClass = U::UObjectGlobals::StaticFindObject<U::UClass*>(nullptr, nullptr, STR("/Game/Characters/Lab_Rat/BP_LabRat.BP_LabRat_C"));
         if (!m_mazeGenClass)
             m_mazeGenClass = U::UObjectGlobals::StaticFindObject<U::UClass*>(nullptr, nullptr, STR("/Game/Procedural_Maze/Maze_Generator.Maze_Generator_C"));
+        if (!m_cheeseClass)
+            m_cheeseClass = U::UObjectGlobals::StaticFindObject<U::UClass*>(nullptr, nullptr, STR("/Game/Interactions/Cheese_Pickup/BP_Cheese_Pickup.BP_Cheese_Pickup_C"));
 
-        // Cache the two UFunctions we care about (then pointer-compare; avoids per-call string work).
+        // Cache the UFunctions we care about (then pointer-compare; avoids per-call string work).
         if (!m_ratTickFn || !m_mazeGenBeginFn) {
             auto name = fn->GetName();
             if (!m_ratTickFn && m_labRatClass && name == STR("ReceiveTick") && ctx->IsA(m_labRatClass)) m_ratTickFn = fn;
@@ -209,8 +240,21 @@ private:
         if (fn == m_mazeGenBeginFn) { onMazeGenBegin(); return; }  // pre-hook: before generation runs
         if (fn != m_ratTickFn) return;                            // else only act on a LabRat tick
 
-        // Per-frame work piggy-backs on the rat tick: log the maze fingerprint shortly after gen.
-        if (m_mazeGenSeen && !m_fpLogged && ++m_mazeGenFrames > 120) { logMazeFingerprint(); m_fpLogged = true; }
+        // Per-frame work piggy-backs on the rat tick.
+        if (m_mazeGenSeen) {
+            ++m_mazeGenFrames;
+            auto* tickActor = U::Cast<U::AActor>(ctx);
+            U::UWorld* world = tickActor ? tickActor->GetWorld() : nullptr;
+            // Build the cheese registry + cache Interact fn once cheese have spawned (~0.5s post-gen).
+            if (!m_cheeseRegistryBuilt && m_mazeGenFrames > 30) {
+                buildCheeseRegistry(world);
+                if (!m_cheeseInteractFn && !m_cheeseById.empty() && m_cheeseById[0])
+                    m_cheeseInteractFn = m_cheeseById[0]->GetFunctionByNameInChain(STR("Interact"));
+            }
+            // Apply any peer cheese-collects (game thread).
+            drainPickupReplays(world);
+            if (!m_fpLogged && m_mazeGenFrames > 120) { logMazeFingerprint(); m_fpLogged = true; }
+        }
 
         auto* rat = U::Cast<U::AActor>(ctx);
         if (!rat || rat == (U::AActor*)m_puppet) return;  // never treat the puppet as local
@@ -268,6 +312,10 @@ private:
     // into the GameInstance so both peers build the same maze.
     void onMazeGenBegin() {
         m_mazeGenSeen = true; m_mazeGenFrames = 0; m_fpLogged = false;
+        // New maze => fresh cheese set. Drop the old registry/dedup so IDs rebuild for this maze.
+        m_cheeseRegistryBuilt = false;
+        m_cheeseById.clear(); m_cheeseIdOf.clear(); m_cheeseProcessed.clear();
+        { std::lock_guard<std::mutex> lk(m_mtx); m_pendingReplay.clear(); }
         int32_t seed = m_forceSeed;
         { std::lock_guard<std::mutex> lk(m_mtx); if (m_haveNetSeed) seed = (int32_t)m_netSeed; }
         if (seed < 0) { Output::send<LogLevel::Default>(STR("[CRCoop] maze gen (seed not forced)\n")); return; }
@@ -280,11 +328,10 @@ private:
                 Output::send<LogLevel::Error>(STR("[CRCoop] 'Random Seed Roll' prop not found\n"));
             }
         }
-        // Host shares its seed with the client (reliable).
+        // Host shares its seed with the client (reliable; queued -> sent on the loop thread).
         if (m_role == crc::Role::Host && m_peerReady) {
             crc::MazeSeedMsg ms; ms.seed = (uint64_t)(uint32_t)seed; ms.genMode = 0;
-            auto f = crc::packFrame(crc::Chan::Control, crc::Msg::MazeSeed, ms.encode());
-            m_transport->send(f.data(), f.size(), true, 0);
+            queueOut(crc::packFrame(crc::Chan::Control, crc::Msg::MazeSeed, ms.encode()), true);
         }
     }
 
@@ -312,6 +359,74 @@ private:
         }
         Output::send<LogLevel::Default>(STR("[CRCoop] MAZE FINGERPRINT rooms={} counted={} hash=0x{:08X}\n"),
                                         roomAmt, counted, combined);
+    }
+
+    // ---- M4 cheese sync (all game-thread) ---------------------------------
+    // Deterministic pickupId = index in the position-sorted cheese list. Both peers build identical
+    // mazes (seed-sync), so identical cheese positions -> identical sort order -> identical IDs,
+    // without the host having to broadcast a map.
+    void buildCheeseRegistry(U::UWorld* world) {
+        m_cheeseById.clear(); m_cheeseIdOf.clear();
+        if (!m_cheeseClass) return;
+        std::vector<U::UObject*> found;
+        U::UObjectGlobals::FindAllOf(STR("BP_Cheese_Pickup_C"), found);
+        std::vector<std::pair<std::array<int, 3>, U::AActor*>> items;
+        items.reserve(found.size());
+        for (auto* o : found) {
+            auto* a = U::Cast<U::AActor>(o);
+            if (!a) continue;
+            U::FVector l = a->K2_GetActorLocation();
+            // quantize to a 4-unit grid (absorbs sub-unit float jitter; cheese are rooms apart)
+            auto q = [](double v) { return (int)std::llround(v / 4.0); };
+            items.push_back({ { q(l.GetX()), q(l.GetY()), q(l.GetZ()) }, a });
+        }
+        std::sort(items.begin(), items.end(),
+                  [](const auto& A, const auto& B) { return A.first < B.first; });
+        for (size_t i = 0; i < items.size(); ++i) {
+            m_cheeseById.push_back(items[i].second);
+            m_cheeseIdOf[items[i].second] = (uint16_t)i;
+        }
+        m_cheeseRegistryBuilt = true;
+        Output::send<LogLevel::Default>(STR("[CRCoop] cheese registry: {} pickups\n"), (int)m_cheeseById.size());
+    }
+
+    // Local rat collected a cheese (observed via the Interact pre-hook). Broadcast it; the peer
+    // replays the same Interact so both instances count + open the exit identically.
+    void onCheeseInteract(U::AActor* cheese, U::UWorld* world) {
+        if (m_replayingInteract) return;             // our own replayed call — don't rebroadcast
+        if (!cheese) return;
+        if (!m_cheeseRegistryBuilt) buildCheeseRegistry(world);
+        auto it = m_cheeseIdOf.find(cheese);
+        if (it == m_cheeseIdOf.end()) return;        // unknown cheese (registry stale) — ignore
+        uint16_t id = it->second;
+        if (m_cheeseProcessed.count(id)) return;     // already counted
+        m_cheeseProcessed.insert(id);
+        crc::PickupCollectedMsg m; m.pickupId = id; m.byPlayer = m_playerId; m.kind = 0; m.tick = m_seq;
+        queueOut(crc::packFrame(crc::Chan::WorldState, crc::Msg::PickupCollected, m.encode()), true);
+        Output::send<LogLevel::Default>(STR("[CRCoop] cheese {} collected locally -> sync\n"), id);
+    }
+
+    // Apply queued peer cheese-collects on the game thread by calling each cheese's own Interact()
+    // (no params) — the faithful path: increments the count, destroys the actor, runs the
+    // dungeon-complete check (-> BP_EnterExit.Open?). Dedup + re-entrancy-guarded.
+    void drainPickupReplays(U::UWorld* world) {
+        std::vector<uint16_t> ids;
+        { std::lock_guard<std::mutex> lk(m_mtx); ids.swap(m_pendingReplay); }
+        if (ids.empty()) return;
+        if (!m_cheeseRegistryBuilt) buildCheeseRegistry(world);
+        for (uint16_t id : ids) {
+            if (m_cheeseProcessed.count(id)) continue;
+            m_cheeseProcessed.insert(id);
+            if (id >= m_cheeseById.size()) continue;
+            U::AActor* cheese = m_cheeseById[id];
+            if (!cheese) continue;
+            if (auto* f = cheese->GetFunctionByNameInChain(STR("Interact"))) {
+                m_replayingInteract = true;
+                cheese->ProcessEvent(f, nullptr);
+                m_replayingInteract = false;
+                Output::send<LogLevel::Default>(STR("[CRCoop] replayed peer cheese {}\n"), id);
+            }
+        }
     }
 
     int cfgIntOpt(const char* cliKey, const wchar_t* envKey, const char* sec, const char* key, int def) {
@@ -346,6 +461,26 @@ private:
     bool m_mazeGenSeen = false;
     bool m_fpLogged = false;
     int m_mazeGenFrames = 0;
+
+    // ---- M4 cheese / pickup sync ------------------------------------------
+    // Outbound queue: game-thread hooks enqueue frames; on_update() (loop thread) flushes them so
+    // we never touch the socket / reliability layer from two threads at once.
+    std::mutex m_outMtx;
+    std::vector<std::pair<bool, std::vector<uint8_t>>> m_outFrames;  // (reliable, frame)
+
+    U::UClass* m_cheeseClass = nullptr;
+    U::UFunction* m_cheeseInteractFn = nullptr;
+    std::vector<U::AActor*> m_cheeseById;                  // pickupId -> actor (position-sorted)
+    std::unordered_map<U::AActor*, uint16_t> m_cheeseIdOf; // actor -> pickupId
+    std::set<uint16_t> m_cheeseProcessed;                  // collected (local or replayed)
+    std::vector<uint16_t> m_pendingReplay;                 // peer collects to replay (guard: m_mtx)
+    bool m_cheeseRegistryBuilt = false;
+    bool m_replayingInteract = false;                      // re-entrancy guard for replayed Interact
+
+    void queueOut(std::vector<uint8_t>&& frame, bool reliable) {
+        std::lock_guard<std::mutex> lk(m_outMtx);
+        m_outFrames.emplace_back(reliable, std::move(frame));
+    }
 };
 
 #define CRCOOP_API __declspec(dllexport)

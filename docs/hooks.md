@@ -86,6 +86,70 @@ Enemy classes still to dump in a real run: cyborg pawns, `DAVE`, `Krueger_Claw_T
 not co-op downed/revive. → **Co-op downed+revive is a mod-added mechanic** (intercept `Kill Rat` to
 enter a "downed" state instead of dying; add proximity revive playing `LabRat_Revive_A`).
 
+## Class-function dump (2026-06-08) — M4/M5 targets
+
+Dumped target class function lists in-maze (CRToolkit `dumpClassByPath`). Confirmed:
+- **Cheese collect = `Interact`**: `Interact_Interface_C` has exactly one method, **`fn Interact`**. So the
+  pickup-collect hook is **`Chese_Pickup_C:Interact`** (and `Last_Chese_Pickup_C:Interact`). ✅
+- **`Chese_Pickup_C` / `Last_Chese_Pickup_C`: NOT loaded at difficulty-0** (`open Maze_LVL` spawns 0 cheese).
+  They load only in a **real run** (rat-select → start). Resolve/cache the class lazily when it loads;
+  dump its full functions in a real run to confirm `Interact` + the count-mutation path.
+- **`BP_EnterExit_C`** ✅: fns `ReceiveBeginPlay`, `ExecuteUbergraph_BP_EnterExit`; prop **`Open?` (bool)** —
+  the exit-open/objective state. No standalone overlap fn (logic is in the ubergraph / via the rat's Interact).
+- **Cyborg spawners** ✅ (loaded): `BP_Cyborg_Spawner_C:Spawn Cyborg Spawner` (+ prop `Cyborgs Spawner To Spawn`
+  ClassProperty, `As Maze Generator`); the v2 spawners (`BP_GatlingCyborg_Spawner_v2_C` etc.) have
+  `ReceiveBeginPlay`, **`Spawn Trap`** (the actual emit), `Setup Rat Info` (gatling), props `Selected Trap`
+  (ClassProperty), `Trap to Spawn` (Array), `Spawn Delay`, `Original Location`. → M5: suppress `Spawn Cyborg
+  Spawner` / `Spawn Trap` on client; host runs them + replicates.
+- **`GameInstance_LabRats_C` run-lifecycle fns** ✅: `Check if Maze is Completed or Not`, `Maze Complete -
+  Update and Save all to slot`, `Reset Maze`, `Reset Game Struct`, `Randomize LabRat 1/2/3` (rat-select),
+  `Load Game Event`. Props: `Cheese Number Array`, `Token Number Array`, `Revive Number Array`,
+  `Selected LabRat ID`, `Random Seed Roll`, `First Game Ever?`.
+
+## Real-run capture (2026-06-08) — enemy/NPC classes + menu START fn ✅
+
+Drove a **real run** (rat-select → loadout → START) with CRToolkit's per-spawn auto-capture.
+Full function/property dumps of each are in `extracted/crtoolkit.log` (search `PER-SPAWN ENEMY:`).
+
+**Enemy / NPC pawn classes** (M5 host-authoritative targets) — all are Characters/Pawns:
+- `BP_DAVE_C` — the DAVE boss.
+- `BP_Canister_Rat_C`, `BP_SmokeBomb_Rat_C`, `BP_SpiderRat_C` — cyborg-rat variants (the actual enemy pawns the spawners emit).
+- `BP_Rat_Critter_C` — critter.
+- `BP_TeamRat_C` — companion team rat (ally; spawned by generator `Spawn LabRat Ai`).
+- (`SpectatorPawn` also appears at menu levels — ignore.)
+→ M5: on client, suppress these (don't run their AI) and spawn transform-driven puppets; host replicates `EnemyState`.
+
+**Menu START (programmatic run-start)** ✅: the loadout screen widget is **`Rat_Selected_Screen_C`**
+(`/Game/Menus/UI/Rat_Selected_Screen.Rat_Selected_Screen_C`). Its START button calls the no-param
+function **`Press Start`** (siblings: `Start Hover ON/OFF`, `Stop Start Button Animation`, `Maze Level`).
+→ Call `widget["Press Start"](widget)` to start a run without the (unreliable) Slate mouse-click.
+CRToolkit `CONFIG.autoStart` does this on the loadout screen. (Menu flow: CONTINUE → Intro → Press
+Start → main menu `START GAME`/`NEW RUN` → `Rat_Select_Screen_C` → `Rat_Selected_Screen_C` loadout.)
+
+### ⭐ Cheese pickup = `BP_Cheese_Pickup_C` ✅ (RESOLVED — the M4 collect target)
+
+`Chese_Pickup_C`/`Last_Chese_Pickup_C` were a **red herring** (unused asset, 0 instances ever). The
+real cheese is **`BP_Cheese_Pickup_C`** = `/Game/Interactions/Cheese_Pickup/BP_Cheese_Pickup.BP_Cheese_Pickup_C`
+(captured live: 10 instances in a real run). Other pickups: **`BP_Revive_Coin_Pickup_C`**,
+**`Toy_Collector_BP_C`** (toy), tokens = `BP_GreenToken_Pickup_C`.
+
+`BP_Cheese_Pickup_C` essentials (full dump in `extracted/crtoolkit.log`):
+| Need | Target | Notes |
+|---|---|---|
+| **Collect** | **`Interact ()`** — NO params | the collect action; safe to call via ProcessEvent(fn,nullptr) |
+| Collect trigger | `Overlap : SphereComponent` + `BndEvt__...ComponentBeginOverlapSignature` | rat enters sphere → interact |
+| Remove effect | **`Destroy Cheese ()`** | destroys actor + FX (called inside Interact path) |
+| Total in maze | prop **`Cheese Amount : Int = 10`** | each cheese knows the maze total |
+| Refs | `As Game Instance Lab Rats`, `As BP Lab Rat`, `As Exit Zone` | |
+| Sensory/visual (local) | `X-Ray ON`, `Line of Sight`, `Smelling Particles`, `Floating Movements` | local-only, do NOT replicate |
+
+**M4 design (confirmed feasible):** deterministic `pickupId` = index of each cheese in the
+position-sorted `FindAllOf(BP_Cheese_Pickup_C)` list (identical on both peers via seed-sync). Hook
+`BP_Cheese_Pickup_C:Interact` (ProcessEvent pre-cb) → on local collect, broadcast `PickupCollected{id}`.
+On receive → call that cheese's `Interact()` (no params) to faithfully replay (count + destroy +
+`Check for Dungeon Complete` → `BP_EnterExit.Open?`). Dedup by `pickupId`; re-entrancy flag so the
+replay's own Interact doesn't re-broadcast. Exit opens on both sides automatically once all collected.
+
 ## Confirmed infra facts
 - UE4SS injects on UE 5.6 via the custom `StaticConstructObject` AOB (see `third_party/ue4ss/overrides/`).
 - Working in this build: `NotifyOnNewObject`, `ExecuteWithDelay`, `FindFirstOf/FindAllOf`, reflection (`ForEachProperty/ForEachFunction`), `ExecuteConsoleCommand` (`open Maze_LVL`).
