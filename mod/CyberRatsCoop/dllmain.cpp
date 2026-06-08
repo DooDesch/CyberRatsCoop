@@ -35,6 +35,7 @@
 #include <unordered_map>
 #include <set>
 #include <algorithm>
+#include <atomic>
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -224,9 +225,10 @@ private:
             m_inEnemyDespawn.push_back(m.enemyId);
             break;
         }
-        case Msg::Death: {   // peer's rat died (M6: awareness; downed/revive is a later tested pass)
+        case Msg::Death: {   // M6: authoritative death announcement for player d.playerId
             auto d = crc::DeathMsg::decode(fr.body);
-            Output::send<LogLevel::Default>(STR("[CRCoop] peer rat {} died\n"), (int)d.playerId);
+            if (d.playerId == m_playerId) m_pendingApplyOwnDeath = true;  // host says MY rat died -> apply (game thread)
+            Output::send<LogLevel::Default>(STR("[CRCoop] peer reports rat {} died\n"), (int)d.playerId);
             break;
         }
         default: break;
@@ -262,7 +264,11 @@ private:
             if (!m_mazeGenBeginFn && m_mazeGenClass && name == STR("ReceiveBeginPlay") && ctx->IsA(m_mazeGenClass)) m_mazeGenBeginFn = fn;
         }
 
-        if (fn == m_mazeGenBeginFn) { onMazeGenBegin(); return; }  // pre-hook: before generation runs
+        if (fn == m_mazeGenBeginFn) {                              // pre-hook: before generation runs
+            auto* gen = U::Cast<U::AActor>(ctx);
+            onMazeGenBegin(gen ? gen->GetWorld() : nullptr);
+            return;
+        }
         if (fn != m_ratTickFn) return;                            // else only act on a LabRat tick
 
         // Per-frame work piggy-backs on the rat tick.
@@ -270,12 +276,15 @@ private:
             ++m_mazeGenFrames;
             auto* tickActor = U::Cast<U::AActor>(ctx);
             U::UWorld* world = tickActor ? tickActor->GetWorld() : nullptr;
-            // Build the cheese registry + cache Interact fn once cheese have spawned (~0.5s post-gen).
-            if (!m_cheeseRegistryBuilt && m_mazeGenFrames > 30) {
-                buildCheeseRegistry(world);
-                if (!m_cheeseInteractFn && !m_cheeseById.empty() && m_cheeseById[0])
-                    m_cheeseInteractFn = m_cheeseById[0]->GetFunctionByNameInChain(STR("Interact"));
+            if (world) m_curWorld = world;
+            // Arm the cheese Interact hook as soon as ANY cheese exists, independent of the registry
+            // frame gate, so a cheese grabbed in the first ~0.5s is still observed (#8).
+            if (!m_cheeseInteractFn) {
+                if (auto* anyCheese = U::UObjectGlobals::FindFirstOf(STR("BP_Cheese_Pickup_C")))
+                    m_cheeseInteractFn = anyCheese->GetFunctionByNameInChain(STR("Interact"));
             }
+            // Build the cheese registry once cheese have spawned (~0.5s post-gen).
+            if (!m_cheeseRegistryBuilt && m_mazeGenFrames > 30) buildCheeseRegistry(world);
             // Apply any peer cheese-collects (game thread).
             drainPickupReplays(world);
 
@@ -299,6 +308,22 @@ private:
         if (!isLocal) return;
         m_localPawn = rat;
         if (!m_killRatFn) m_killRatFn = rat->GetFunctionByNameInChain(STR("Kill Rat"));  // M6
+
+        // M6: keep the per-player death latch in sync with the rat's real state — reset on revive (#9).
+        if (auto* deadP = rat->GetValuePtrByPropertyNameInChain<bool>(STR("Is Dead"))) {
+            if (!*deadP) m_ratDead[m_playerId] = false;
+        }
+        // M6: apply a host-authoritative death the peer announced for our rat (game thread).
+        if (m_pendingApplyOwnDeath) {
+            m_pendingApplyOwnDeath = false;
+            if (m_killRatFn && !m_ratDead[m_playerId]) {
+                m_ratDead[m_playerId] = true;
+                m_applyingRemoteDeath = true;
+                rat->ProcessEvent(m_killRatFn, nullptr);
+                m_applyingRemoteDeath = false;
+                Output::send<LogLevel::Default>(STR("[CRCoop] applied host-authoritative death to local rat\n"));
+            }
+        }
 
         // Read local transform -> outbound snapshot.
         U::FVector loc = rat->K2_GetActorLocation();
@@ -345,15 +370,31 @@ private:
 
     // Pre-hook on Maze_Generator:ReceiveBeginPlay — runs BEFORE generation. Force the shared seed
     // into the GameInstance so both peers build the same maze.
-    void onMazeGenBegin() {
+    void onMazeGenBegin(U::UWorld* genWorld) {
         m_mazeGenSeen = true; m_mazeGenFrames = 0; m_fpLogged = false;
+        // Did the world change (full level reload) vs an in-place regen? If the world changed, the
+        // engine already destroyed the old puppets, so we must NOT call K2_DestroyActor on them
+        // (that was the use-after-free, #1) — just drop the dangling pointers. If same world, destroy.
+        bool sameWorld = (genWorld && genWorld == m_curWorld);
+
         // New maze => fresh cheese set. Drop the old registry/dedup so IDs rebuild for this maze.
         m_cheeseRegistryBuilt = false;
         m_cheeseById.clear(); m_cheeseIdOf.clear(); m_cheeseProcessed.clear();
         { std::lock_guard<std::mutex> lk(m_mtx); m_pendingReplay.clear(); }
         m_enemyPollCtr = 0;
-        resetEnemies();   // fresh enemy ids/puppets for the new maze
-        m_localRatDead = false;  // M6: new run, rat alive again
+        resetEnemies(sameWorld);   // fresh enemy ids/puppets for the new maze
+
+        // Player puppet: destroy only if still in the live world; always drop the pointer so
+        // maintainPuppet re-spawns a fresh one. Also clear the stale remote snapshot.
+        if (m_puppet) {
+            if (sameWorld) ((U::AActor*)m_puppet)->K2_DestroyActor();
+            m_puppet = nullptr;
+        }
+        { std::lock_guard<std::mutex> lk(m_mtx); m_haveRemote = false; }
+
+        m_ratDead[0] = m_ratDead[1] = false;  // M6: new run, both rats alive again
+        m_pendingApplyOwnDeath = false;
+        if (genWorld) m_curWorld = genWorld;
         int32_t seed = m_forceSeed;
         { std::lock_guard<std::mutex> lk(m_mtx); if (m_haveNetSeed) seed = (int32_t)m_netSeed; }
         if (seed < 0) { Output::send<LogLevel::Default>(STR("[CRCoop] maze gen (seed not forced)\n")); return; }
@@ -400,9 +441,14 @@ private:
     }
 
     // ---- M4 cheese sync (all game-thread) ---------------------------------
-    // Deterministic pickupId = index in the position-sorted cheese list. Both peers build identical
-    // mazes (seed-sync), so identical cheese positions -> identical sort order -> identical IDs,
-    // without the host having to broadcast a map.
+    // pickupId = 16-bit hash of the cheese's quantized world position (#6) — independent of the
+    // FindAllOf iteration order (which differs between processes), so both peers derive the SAME id
+    // for the same physical cheese without the host broadcasting a map. Collisions resolved by a
+    // deterministic monotonic walk over a fully-ordered (qx,qy,qz) list (odd step -> full period).
+    static uint16_t cheeseHash(int qx, int qy, int qz) {
+        int32_t v[3] = { qx, qy, qz };
+        return (uint16_t)(crc::fnv1a((const uint8_t*)v, sizeof(v)) & 0xFFFFu);
+    }
     void buildCheeseRegistry(U::UWorld* world) {
         m_cheeseById.clear(); m_cheeseIdOf.clear();
         if (!m_cheeseClass) return;
@@ -418,13 +464,16 @@ private:
             auto q = [](double v) { return (int)std::llround(v / 4.0); };
             items.push_back({ { q(l.GetX()), q(l.GetY()), q(l.GetZ()) }, a });
         }
+        // Total ordering so both peers resolve hash collisions in the same sequence.
         std::sort(items.begin(), items.end(),
                   [](const auto& A, const auto& B) { return A.first < B.first; });
-        for (size_t i = 0; i < items.size(); ++i) {
-            m_cheeseById.push_back(items[i].second);
-            m_cheeseIdOf[items[i].second] = (uint16_t)i;
+        for (auto& it : items) {
+            uint16_t id = cheeseHash(it.first[0], it.first[1], it.first[2]);
+            for (int g = 0; m_cheeseById.count(id) && g < 0x10000; ++g) id = (uint16_t)(id + 0x9E37u);
+            m_cheeseById[id] = it.second;
+            m_cheeseIdOf[it.second] = id;
         }
-        m_cheeseRegistryBuilt = true;
+        if (!m_cheeseById.empty()) m_cheeseRegistryBuilt = true;   // don't latch on an empty/early build (#2)
         Output::send<LogLevel::Default>(STR("[CRCoop] cheese registry: {} pickups\n"), (int)m_cheeseById.size());
     }
 
@@ -439,7 +488,8 @@ private:
         uint16_t id = it->second;
         if (m_cheeseProcessed.count(id)) return;     // already counted
         m_cheeseProcessed.insert(id);
-        crc::PickupCollectedMsg m; m.pickupId = id; m.byPlayer = m_playerId; m.kind = 0; m.tick = m_seq;
+        crc::PickupCollectedMsg m; m.pickupId = id; m.byPlayer = m_playerId; m.kind = 0;
+        m.tick = (uint32_t)m_mazeGenFrames;          // game-thread value (avoid racing loop-thread m_seq, #10)
         queueOut(crc::packFrame(crc::Chan::WorldState, crc::Msg::PickupCollected, m.encode()), true);
         Output::send<LogLevel::Default>(STR("[CRCoop] cheese {} collected locally -> sync\n"), id);
     }
@@ -451,20 +501,24 @@ private:
         std::vector<uint16_t> ids;
         { std::lock_guard<std::mutex> lk(m_mtx); ids.swap(m_pendingReplay); }
         if (ids.empty()) return;
-        if (!m_cheeseRegistryBuilt) buildCheeseRegistry(world);
+        if (!m_cheeseRegistryBuilt) buildCheeseRegistry(world);   // only latches if cheese exist now (#2)
+        std::vector<uint16_t> requeue;
         for (uint16_t id : ids) {
-            if (m_cheeseProcessed.count(id)) continue;
-            m_cheeseProcessed.insert(id);
-            if (id >= m_cheeseById.size()) continue;
-            U::AActor* cheese = m_cheeseById[id];
-            if (!cheese) continue;
-            if (auto* f = cheese->GetFunctionByNameInChain(STR("Interact"))) {
+            if (m_cheeseProcessed.count(id)) continue;            // already counted
+            if (!m_cheeseRegistryBuilt) { requeue.push_back(id); continue; }  // cheese not spawned yet -> retry
+            auto it = m_cheeseById.find(id);
+            if (it == m_cheeseById.end() || !it->second) { m_cheeseProcessed.insert(id); continue; } // bad id -> drop
+            if (auto* f = it->second->GetFunctionByNameInChain(STR("Interact"))) {
                 m_replayingInteract = true;
-                cheese->ProcessEvent(f, nullptr);
+                it->second->ProcessEvent(f, nullptr);
                 m_replayingInteract = false;
+                m_cheeseProcessed.insert(id);                     // mark only AFTER a successful apply
                 Output::send<LogLevel::Default>(STR("[CRCoop] replayed peer cheese {}\n"), id);
+            } else {
+                requeue.push_back(id);
             }
         }
+        if (!requeue.empty()) { std::lock_guard<std::mutex> lk(m_mtx); for (uint16_t id : requeue) m_pendingReplay.push_back(id); }
     }
 
     // ---- M5 enemies (all game-thread) -------------------------------------
@@ -554,6 +608,22 @@ private:
         }
     }
 
+    // Stop a spawned enemy puppet's AI: destroy its auto-possessed AIController so it issues no
+    // MoveTo (we drive the transform ourselves). Re-applied on each state snap since possession can
+    // happen a frame after spawn (#7).
+    void stopActorAI(U::AActor* a) {
+        if (!a) return;
+        if (auto** ctrl = a->GetValuePtrByPropertyNameInChain<U::UObject*>(STR("Controller"))) {
+            if (auto* c = U::Cast<U::AActor>(*ctrl)) c->K2_DestroyActor();
+        }
+    }
+    void neutralizeEnemyPuppet(U::AActor* p) {
+        if (!p) return;
+        p->SetActorEnableCollision(false);   // host-authoritative: puppet deals no damage
+        p->SetActorTickEnabled(false);       // stop the BP ubergraph
+        stopActorAI(p);                      // stop the controller / MoveTo
+    }
+
     // CLIENT: apply host enemy events on the game thread — spawn/drive/destroy puppets.
     void drainEnemyEvents(U::UWorld* world) {
         std::vector<crc::EnemySpawnMsg> spawns;
@@ -565,16 +635,29 @@ private:
             despawns.swap(m_inEnemyDespawn);
             if (m_haveEnemyState) { state = m_inEnemyState; haveState = true; m_haveEnemyState = false; }
         }
+        // Despawns FIRST so a deferred spawn for the same id is dropped, never resurrected (#5).
+        for (uint16_t id : despawns) {
+            m_recentDespawn.insert(id);   // host ids are monotonic -> safe to remember for the maze
+            m_deferRetry.erase(id);
+            auto it = m_enemyPuppet.find(id);
+            if (it != m_enemyPuppet.end()) {
+                if (it->second) { m_puppetSet.erase(it->second); it->second->K2_DestroyActor(); }
+                m_enemyPuppet.erase(it);
+            }
+        }
+        // Spawns: skip already-despawned ids; defer (bounded, #4) until the archetype UClass is cached.
         std::vector<crc::EnemySpawnMsg> deferred;
         for (auto& sp : spawns) {
             if (m_enemyPuppet.count(sp.enemyId)) continue;
+            if (m_recentDespawn.count(sp.enemyId)) continue;          // host already despawned it
             U::UClass* cls = (sp.archetype < 6) ? m_archetypeClass[sp.archetype] : nullptr;
-            if (!cls || !world) { deferred.push_back(sp); continue; } // class not cached yet -> retry
+            if (!cls || !world) { if (++m_deferRetry[sp.enemyId] <= 600) deferred.push_back(sp); continue; }
+            m_deferRetry.erase(sp.enemyId);
             U::FVector loc((double)sp.x, (double)sp.y, (double)sp.z);
             U::FRotator rot(0.0, u16ToYaw(sp.yaw), 0.0);
             U::AActor* p = world->SpawnActor(cls, &loc, &rot);
             if (!p) continue;
-            neutralizeActor(p, false);   // visible, but no collision/AI; transform-driven
+            neutralizeEnemyPuppet(p);   // visible, but no collision/AI; transform-driven
             m_enemyPuppet[sp.enemyId] = p; m_puppetSet.insert(p);
         }
         if (!deferred.empty()) {
@@ -589,37 +672,45 @@ private:
                 U::FRotator rot(0.0, u16ToYaw(en.yaw), 0.0);
                 U::FHitResult hit{};
                 it->second->K2_SetActorLocationAndRotation(loc, rot, false, hit, true);
-            }
-        }
-        for (uint16_t id : despawns) {
-            auto it = m_enemyPuppet.find(id);
-            if (it != m_enemyPuppet.end()) {
-                if (it->second) { m_puppetSet.erase(it->second); it->second->K2_DestroyActor(); }
-                m_enemyPuppet.erase(it);
+                stopActorAI(it->second);   // kill any controller that (re)possessed after spawn
             }
         }
     }
 
-    void resetEnemies() {
+    void resetEnemies(bool destroyPuppets) {
         m_enemyIdOf.clear(); m_enemyById.clear(); m_enemyArch.clear(); m_nextEnemyId = 1;
-        for (auto& kv : m_enemyPuppet) if (kv.second) kv.second->K2_DestroyActor();
+        // Only destroy puppets if they still live in the current world; on a world reload the engine
+        // already freed them, so destroying would be a use-after-free (#1).
+        if (destroyPuppets) for (auto& kv : m_enemyPuppet) if (kv.second) kv.second->K2_DestroyActor();
         m_enemyPuppet.clear(); m_puppetSet.clear(); m_neutralizedLocal.clear();
+        m_recentDespawn.clear(); m_deferRetry.clear();
         std::lock_guard<std::mutex> lk(m_mtx);
         m_inEnemySpawn.clear(); m_inEnemyDespawn.clear(); m_haveEnemyState = false;
         // m_archetypeClass cache persists across mazes (classes don't change).
     }
 
     // ---- M6 death detection (game thread) ---------------------------------
+    // "Kill Rat" fires for the local rat AND the remote puppet (same class fn). The host owns the
+    // live enemies, so the host's puppet IS the client's rat — if a host enemy kills it, the host
+    // authoritatively announces Death{clientId} and the client then kills its own rat.
     void onRatKilled(U::AActor* rat) {
-        if (!rat || rat == (U::AActor*)m_puppet) return;  // ignore the peer's puppet
-        if (m_localRatDead) return;
-        m_localRatDead = true;
+        if (!rat) return;
+        if (m_applyingRemoteDeath) return;            // we triggered this Kill Rat ourselves
+        uint8_t pid;
+        if (rat == (U::AActor*)m_puppet) {
+            if (m_role != crc::Role::Host) return;    // only the host authoritatively kills the peer's rat
+            pid = (uint8_t)(1 - m_playerId);          // the peer (client) id
+        } else {
+            pid = m_playerId;                          // our own rat
+        }
+        if (pid > 1 || m_ratDead[pid]) return;         // already announced this run
+        m_ratDead[pid] = true;
         U::FVector l = rat->K2_GetActorLocation();
         crc::DeathMsg d;
-        d.playerId = m_playerId; d.cause = 0; d.killerEnemyId = 0;
+        d.playerId = pid; d.cause = 0; d.killerEnemyId = 0;
         d.x = (float)l.GetX(); d.y = (float)l.GetY(); d.z = (float)l.GetZ();
         queueOut(crc::packFrame(crc::Chan::Control, crc::Msg::Death, d.encode()), true);
-        Output::send<LogLevel::Default>(STR("[CRCoop] local rat died -> broadcast death\n"));
+        Output::send<LogLevel::Default>(STR("[CRCoop] rat {} died -> broadcast death\n"), (int)pid);
     }
 
     int cfgIntOpt(const char* cliKey, const wchar_t* envKey, const char* sec, const char* key, int def) {
@@ -633,7 +724,7 @@ private:
     crc::Role m_role = crc::Role::Unknown;
     uint8_t m_playerId = 0;
     bool m_helloSent = false;
-    bool m_peerReady = false;
+    std::atomic<bool> m_peerReady{false};   // written on loop thread, read on game thread (#11)
     uint64_t m_lastSend = 0;
     uint16_t m_seq = 0;
 
@@ -650,6 +741,7 @@ private:
     U::UFunction* m_mazeGenBeginFn = nullptr;
     U::AActor* m_localPawn = nullptr;
     U::UObject* m_puppet = nullptr;
+    U::UWorld* m_curWorld = nullptr;   // last world seen on the game thread (detect world change, #1)
     int m_forceSeed = -1;
     bool m_mazeGenSeen = false;
     bool m_fpLogged = false;
@@ -663,7 +755,7 @@ private:
 
     U::UClass* m_cheeseClass = nullptr;
     U::UFunction* m_cheeseInteractFn = nullptr;
-    std::vector<U::AActor*> m_cheeseById;                  // pickupId -> actor (position-sorted)
+    std::unordered_map<uint16_t, U::AActor*> m_cheeseById; // pickupId(pos-hash) -> actor (#6)
     std::unordered_map<U::AActor*, uint16_t> m_cheeseIdOf; // actor -> pickupId
     std::set<uint16_t> m_cheeseProcessed;                  // collected (local or replayed)
     std::vector<uint16_t> m_pendingReplay;                 // peer collects to replay (guard: m_mtx)
@@ -684,16 +776,21 @@ private:
     std::set<U::AActor*> m_puppetSet;                       // client: actors I spawned (skip neutralize)
     std::set<U::AActor*> m_neutralizedLocal;               // client: local AI enemies already hidden
     int m_enemyPollCtr = 0;
+    std::set<uint16_t> m_recentDespawn;                    // client: ids despawned -> drop late spawns (#5)
+    std::unordered_map<uint16_t, int> m_deferRetry;        // client: deferred-spawn retry counts (#4)
     // incoming enemy events (loop thread -> game thread; guarded by m_mtx)
     std::vector<crc::EnemySpawnMsg> m_inEnemySpawn;
     crc::EnemyStateMsg m_inEnemyState; bool m_haveEnemyState = false;
     std::vector<uint16_t> m_inEnemyDespawn;
 
-    // ---- M6 death (minimal): detect local rat death + broadcast. The full co-op downed/revive
-    // mechanic needs a blocking hook on "Kill Rat" (the global ProcessEvent pre-cb is observe-only)
-    // plus host-authoritative damage, so it's deferred to a tested pass.
+    // ---- M6 death (host-authoritative) ------------------------------------
+    // "Kill Rat" is a class-level BP fn, so the cached UFunction* matches it on ANY BP_LabRat
+    // (the local rat AND the remote puppet). When the host's live enemy kills the client's puppet,
+    // the host broadcasts Death{clientId}; the client then applies the death to its own rat.
     U::UFunction* m_killRatFn = nullptr;
-    bool m_localRatDead = false;
+    bool m_ratDead[2] = { false, false };                  // [playerId] dead this run (dedup)
+    bool m_applyingRemoteDeath = false;                    // re-entrancy guard for applied death
+    bool m_pendingApplyOwnDeath = false;                   // set by dispatch -> kill local rat on game thread
 
     void queueOut(std::vector<uint8_t>&& frame, bool reliable) {
         std::lock_guard<std::mutex> lk(m_outMtx);
