@@ -61,13 +61,55 @@ instances logged `spawned remote puppet rat` + `puppet neutralized (Turn Off Rat
   rolled/consumed); add a fingerprint that enumerates the real spawned room actors, or compare maze
   screenshots between peers.
 
-## ⏭ Remaining (de-risked — all required techniques proven)
+## ✅ M4 — Pickups + objective (cheese sync) — COMPLETE, runtime-validated 2026-06-08
 
-M3 full validation in a real run; **M4** pickups/objective (hook `Spawn All Cheese` / cheese interact,
-host-authoritative); **M5** host-authoritative enemies (suppress client `Spawn Cyborgs At Location`,
-replicate enemy state); **M6** death/revive (intercept `Kill Rat` → downed; proximity revive with
-`LabRat_Revive_A`); **M7** Steam P2P transport + anim/montage sync + netcode smoothing + polish.
-The build pipeline (`scripts/build_mod.ps1`, ~6 s incremental) and 2-instance test loop are established.
+Single-instance in-game validation PASSED: entering a real run logged
+`[CRCoop] cheese registry: 10 pickups` on maze gen with **no crash** (cheese class resolves,
+`FindAllOf` works, deterministic IDs assigned). Still to do with a 2nd instance: confirm a collected
+cheese disappears + counts on the peer (see `docs/test-plan.md`).
+- **Real cheese class = `BP_Cheese_Pickup_C`** (the M0 `Chese_Pickup_C` was an unused decoy);
+  no-param `Interact()` collect fn. See `docs/hooks.md`.
+- Deterministic `pickupId` = index in position-sorted `FindAllOf(BP_Cheese_Pickup_C)` (identical on
+  both peers via seed-sync — no id-map broadcast). ProcessEvent fast-path hooks `Interact` → on local
+  collect broadcast `PickupCollected{id}`; on receive, faithfully replay by calling that cheese's
+  `Interact()` (count + `Destroy Cheese` + dungeon-complete → `BP_EnterExit.Open?`). Dedup + re-entrancy
+  guard. Thread-safe outbound queue (game-thread hooks enqueue; loop thread is the sole socket driver).
+
+## 🟡 M5 — Host-authoritative enemies — SCAFFOLD built green, NEEDS 2-instance validation
+
+Enemies are AI-driven (`Random Roam`/NavMesh `MoveTo`/chase) → non-deterministic, so host-authoritative.
+Enemy classes captured live: `BP_DAVE_C`, `BP_Canister_Rat_C`, `BP_SmokeBomb_Rat_C`, `BP_SpiderRat_C`,
+`BP_Rat_Critter_C`, `BP_TeamRat_C`.
+- **Host** (role=host): ~10 Hz `FindAllOf` enemies → monotonic id, broadcast `EnemySpawn`(reliable) +
+  batched `EnemyState`(unreliable) + `EnemyDespawn`.
+- **Client** (role=client): hide its own AI enemies (`SetActorHiddenInGame`+collision/tick off) and
+  spawn host-driven puppets (collision/tick off, transform snapped from `EnemyState`); archetype
+  `UClass` cached from a live instance; unhandled spawns re-queued until cached.
+- ⚠️ **Open risks to test:** client rat can't be damaged while all its enemies are neutralized → death
+  must become host-authoritative (ties into M6); puppet AIController may still `MoveTo` (we override
+  each state tick); `EnemyHit` (client→host damage) not wired yet.
+
+## 🟡 M6 — Death — detection+sync done; downed/revive deferred
+
+- **Done (builds green):** cache `BP_LabRat_C:"Kill Rat"`; ProcessEvent fast-path → broadcast
+  `DeathMsg{playerId,pos}`; peer logs awareness; reset per maze.
+- **Deferred (needs a blocking hook + testing):** the global ProcessEvent pre-callback is
+  **observe-only** — it cannot turn `Kill Rat` into a "downed" state. Full downed/revive needs a
+  Lua-side blocking `RegisterHook` on `Kill Rat` and/or host-authoritative damage (host owns enemy
+  collision via M5), plus proximity revive playing `LabRat_Revive_A`.
+
+## ⏭ Remaining
+
+- **2-instance co-test of M4/M5/M6** (needs the foreground / the user — deferred while the user games
+  on the same machine). Procedure: `docs/test-plan.md`.
+- **M6 downed/revive** (after the host-auth-damage decision from the M5 test).
+- **M7** Steam P2P transport (`ISteamNetworkingSockets` behind `INetTransport`) + Steam invites +
+  anim/montage sync + netcode smoothing + polish.
+The build pipeline (xmake incremental ~6–8 s) and 2-instance launch method are established.
+
+> **Dead-rat gotcha** (affects testing + run-lifecycle): if the selected rat is dead, START / loadout
+> `Press Start` silently do nothing until you click **NEW RAT** (tooltip "Remove dead rat / Get a new
+> rat") or **REVIVE**. Loadout START can be driven programmatically via `Rat_Selected_Screen_C:"Press Start"`.
 
 ### (historical) M1 build/code notes
 
