@@ -42,3 +42,6 @@ CMakeCache.txt
 *.user
 Thumbs.db
 desktop.ini
+
+# standalone protocol test binary
+*.exe
