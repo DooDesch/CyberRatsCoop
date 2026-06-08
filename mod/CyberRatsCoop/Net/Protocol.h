@@ -160,6 +160,84 @@ struct MazeSeedMsg {
     static MazeSeedMsg decode(const std::vector<uint8_t>& b) { ByteReader r(b.data(), b.size()); MazeSeedMsg m; m.seed = r.u64(); m.genMode = r.u8(); m.paramHash = r.u32(); return m; }
 };
 
+// ---- M4 pickups & objective & run lifecycle --------------------------------
+struct PickupCollectedMsg {            // 0x30 — client req / host confirm
+    uint16_t pickupId = 0; uint8_t byPlayer = 0; uint8_t kind = 0; uint32_t tick = 0;
+    std::vector<uint8_t> encode() const { ByteWriter w; w.u16(pickupId); w.u8(byPlayer); w.u8(kind); w.u32(tick); return w.buf; }
+    static PickupCollectedMsg decode(const std::vector<uint8_t>& b) { ByteReader r(b.data(), b.size()); PickupCollectedMsg m; m.pickupId=r.u16(); m.byPlayer=r.u8(); m.kind=r.u8(); m.tick=r.u32(); return m; }
+};
+struct PickupStateSyncMsg {            // 0x31 — host->client keyframe
+    struct Entry { uint16_t pickupId; uint8_t state; };   // state: 1=present, 0=collected
+    std::vector<Entry> entries;
+    std::vector<uint8_t> encode() const { ByteWriter w; w.u8((uint8_t)std::min<size_t>(entries.size(),255)); for (auto& e : entries) { w.u16(e.pickupId); w.u8(e.state); } return w.buf; }
+    static PickupStateSyncMsg decode(const std::vector<uint8_t>& b) { ByteReader r(b.data(), b.size()); PickupStateSyncMsg m; uint8_t n=r.u8(); for (uint8_t i=0;i<n;++i){ Entry e; e.pickupId=r.u16(); e.state=r.u8(); m.entries.push_back(e);} return m; }
+};
+struct ObjectiveReachedMsg {           // 0x40
+    uint16_t objectiveId = 0; uint8_t byPlayer = 0;
+    std::vector<uint8_t> encode() const { ByteWriter w; w.u16(objectiveId); w.u8(byPlayer); return w.buf; }
+    static ObjectiveReachedMsg decode(const std::vector<uint8_t>& b) { ByteReader r(b.data(), b.size()); ObjectiveReachedMsg m; m.objectiveId=r.u16(); m.byPlayer=r.u8(); return m; }
+};
+struct RunStartMsg {                   // 0x70
+    uint32_t runId = 0; uint64_t seed = 0; uint16_t countdownMs = 0;
+    std::vector<uint8_t> encode() const { ByteWriter w; w.u32(runId); w.u64(seed); w.u16(countdownMs); return w.buf; }
+    static RunStartMsg decode(const std::vector<uint8_t>& b) { ByteReader r(b.data(), b.size()); RunStartMsg m; m.runId=r.u32(); m.seed=r.u64(); m.countdownMs=r.u16(); return m; }
+};
+struct RunEndMsg {                     // 0x71
+    uint32_t runId = 0; uint8_t result = 0; uint8_t reason = 0;
+    std::vector<uint8_t> encode() const { ByteWriter w; w.u32(runId); w.u8(result); w.u8(reason); return w.buf; }
+    static RunEndMsg decode(const std::vector<uint8_t>& b) { ByteReader r(b.data(), b.size()); RunEndMsg m; m.runId=r.u32(); m.result=r.u8(); m.reason=r.u8(); return m; }
+};
+struct RestartMsg {                    // 0x72
+    uint32_t newRunId = 0; uint64_t newSeed = 0;
+    std::vector<uint8_t> encode() const { ByteWriter w; w.u32(newRunId); w.u64(newSeed); return w.buf; }
+    static RestartMsg decode(const std::vector<uint8_t>& b) { ByteReader r(b.data(), b.size()); RestartMsg m; m.newRunId=r.u32(); m.newSeed=r.u64(); return m; }
+};
+
+// ---- M5 enemies (host-authoritative) ---------------------------------------
+struct EnemySpawnMsg {                 // 0x50
+    uint16_t enemyId = 0; uint8_t archetype = 0; float x=0,y=0,z=0; uint16_t yaw=0; uint16_t spawnerId=0;
+    std::vector<uint8_t> encode() const { ByteWriter w; w.u16(enemyId); w.u8(archetype); w.f32(x); w.f32(y); w.f32(z); w.u16(yaw); w.u16(spawnerId); return w.buf; }
+    static EnemySpawnMsg decode(const std::vector<uint8_t>& b) { ByteReader r(b.data(), b.size()); EnemySpawnMsg m; m.enemyId=r.u16(); m.archetype=r.u8(); m.x=r.f32(); m.y=r.f32(); m.z=r.f32(); m.yaw=r.u16(); m.spawnerId=r.u16(); return m; }
+};
+struct EnemyStateMsg {                 // 0x51 — batched (Δ + 1 Hz keyframe)
+    struct Entry { uint16_t enemyId; float x,y,z; uint16_t yaw; uint8_t anim; uint8_t flags; uint8_t hp; };
+    std::vector<Entry> entries;
+    std::vector<uint8_t> encode() const { ByteWriter w; w.u16((uint16_t)entries.size()); for (auto& e : entries){ w.u16(e.enemyId); w.f32(e.x); w.f32(e.y); w.f32(e.z); w.u16(e.yaw); w.u8(e.anim); w.u8(e.flags); w.u8(e.hp);} return w.buf; }
+    static EnemyStateMsg decode(const std::vector<uint8_t>& b) { ByteReader r(b.data(), b.size()); EnemyStateMsg m; uint16_t n=r.u16(); for (uint16_t i=0;i<n;++i){ Entry e; e.enemyId=r.u16(); e.x=r.f32(); e.y=r.f32(); e.z=r.f32(); e.yaw=r.u16(); e.anim=r.u8(); e.flags=r.u8(); e.hp=r.u8(); m.entries.push_back(e);} return m; }
+};
+struct EnemyDespawnMsg {               // 0x52
+    uint16_t enemyId = 0; uint8_t reason = 0;
+    std::vector<uint8_t> encode() const { ByteWriter w; w.u16(enemyId); w.u8(reason); return w.buf; }
+    static EnemyDespawnMsg decode(const std::vector<uint8_t>& b) { ByteReader r(b.data(), b.size()); EnemyDespawnMsg m; m.enemyId=r.u16(); m.reason=r.u8(); return m; }
+};
+struct EnemyHitMsg {                    // 0x53 — client->host
+    uint16_t enemyId = 0; uint8_t byPlayer = 0; uint16_t dmg = 0; float hx=0,hy=0,hz=0;
+    std::vector<uint8_t> encode() const { ByteWriter w; w.u16(enemyId); w.u8(byPlayer); w.u16(dmg); w.f32(hx); w.f32(hy); w.f32(hz); return w.buf; }
+    static EnemyHitMsg decode(const std::vector<uint8_t>& b) { ByteReader r(b.data(), b.size()); EnemyHitMsg m; m.enemyId=r.u16(); m.byPlayer=r.u8(); m.dmg=r.u16(); m.hx=r.f32(); m.hy=r.f32(); m.hz=r.f32(); return m; }
+};
+
+// ---- M6 death / downed / revive --------------------------------------------
+struct DeathMsg {                      // 0x60
+    uint8_t playerId = 0; uint8_t cause = 0; uint16_t killerEnemyId = 0; float x=0,y=0,z=0;
+    std::vector<uint8_t> encode() const { ByteWriter w; w.u8(playerId); w.u8(cause); w.u16(killerEnemyId); w.f32(x); w.f32(y); w.f32(z); return w.buf; }
+    static DeathMsg decode(const std::vector<uint8_t>& b) { ByteReader r(b.data(), b.size()); DeathMsg m; m.playerId=r.u8(); m.cause=r.u8(); m.killerEnemyId=r.u16(); m.x=r.f32(); m.y=r.f32(); m.z=r.f32(); return m; }
+};
+struct DownedStateMsg {                // 0x61
+    uint8_t playerId = 0; uint8_t downed = 0; uint8_t revivePct = 0;
+    std::vector<uint8_t> encode() const { ByteWriter w; w.u8(playerId); w.u8(downed); w.u8(revivePct); return w.buf; }
+    static DownedStateMsg decode(const std::vector<uint8_t>& b) { ByteReader r(b.data(), b.size()); DownedStateMsg m; m.playerId=r.u8(); m.downed=r.u8(); m.revivePct=r.u8(); return m; }
+};
+struct ReviveStartMsg {                // 0x62
+    uint8_t targetPlayer = 0; uint8_t byPlayer = 0;
+    std::vector<uint8_t> encode() const { ByteWriter w; w.u8(targetPlayer); w.u8(byPlayer); return w.buf; }
+    static ReviveStartMsg decode(const std::vector<uint8_t>& b) { ByteReader r(b.data(), b.size()); ReviveStartMsg m; m.targetPlayer=r.u8(); m.byPlayer=r.u8(); return m; }
+};
+struct ReviveCompleteMsg {             // 0x63
+    uint8_t targetPlayer = 0; uint8_t restoredHp = 0;
+    std::vector<uint8_t> encode() const { ByteWriter w; w.u8(targetPlayer); w.u8(restoredHp); return w.buf; }
+    static ReviveCompleteMsg decode(const std::vector<uint8_t>& b) { ByteReader r(b.data(), b.size()); ReviveCompleteMsg m; m.targetPlayer=r.u8(); m.restoredHp=r.u8(); return m; }
+};
+
 // FNV-1a 32-bit (matches the Lua fingerprint in CRToolkit for cross-checking).
 inline uint32_t fnv1a(const uint8_t* d, size_t n) {
     uint32_t h = 2166136261u;

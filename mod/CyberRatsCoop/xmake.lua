@@ -13,6 +13,8 @@ local projectName = "CyberRatsCoop"
 target(projectName)
     add_rules("ue4ss.mod")
     add_includedirs(".")
+    -- Verified, in-game-tested sources only. Workflow-drafted modules (Game/MazeModule.cpp,
+    -- Game/Pickups.cpp) are kept as reference/WIP and added here once integrated + built + tested.
     add_files("dllmain.cpp", "Transport/UdpTransport.cpp")
     -- Winsock for the UDP transport (Steam GNS added in M7).
     add_syslinks("ws2_32")
