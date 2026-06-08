@@ -61,6 +61,29 @@ instances logged `spawned remote puppet rat` + `puppet neutralized (Turn Off Rat
   rolled/consumed); add a fingerprint that enumerates the real spawned room actors, or compare maze
   screenshots between peers.
 
+## ✅ Live 2-instance test (2026-06-09) — core co-op validated end-to-end
+
+Host (Steam launch, role=host) + client (bootstrap exe, `-CRCoopRole=client -CRCoopConnect=127.0.0.1`),
+loopback UDP, both forced seed 1337. **Verified in one shared session, no crash:**
+- M1 handshake — both logged `co-op link established`.
+- M2 — **both instances spawned a puppet rat of the other** (`spawned remote puppet rat` ×2 + `Turn Off Rat`).
+- M3 — both forced/built maze seed 1337 (`forced maze seed = 1337`).
+- M4 — both built the cheese registry (`cheese registry: 10 pickups`, hash IDs).
+- Enemies spawned in the maze (DAVE, critters, spiders, team rats).
+- **No crash, no `[CRCoop]` errors across the whole run — the use-after-free fix (#1) holds.**
+
+Then **adversarially reviewed** the M4/M5/M6 code with a multi-agent workflow → 11 real bugs found
+(incl. the m_puppet use-after-free crash, cheese-id desync, host-auth death gap, 2 races) → **all
+fixed** (commit "Fix 11 bugs from adversarial review"). Test-driven follow-ups (commit "Test-driven…"):
+robust death detection via **`Is Dead` polling** (a trap death bypassed the `Kill Rat` hook),
+**production seed-sync** (host always shares its seed; client mirrors — no manual force_seed needed),
+and M5 enemy-spawn/puppet logging.
+
+**Still to demo live (implemented + protocol-tested + reviewed, but not yet shown firing in-game):**
+the cheese collect→replay *event* across instances (manual nav kills the rat in traps; the Lua
+auto-collect harness has a find-cheese bug), the M5 enemy-puppet visual mirroring, and an actual
+host-authoritative enemy kill of the client's rat. See `docs/test-plan.md`.
+
 ## ✅ M4 — Pickups + objective (cheese sync) — COMPLETE, runtime-validated 2026-06-08
 
 Single-instance in-game validation PASSED: entering a real run logged
