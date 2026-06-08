@@ -84,8 +84,8 @@ class CyberRatsCoopMod : public CppUserModBase {
 public:
     CyberRatsCoopMod() : CppUserModBase() {
         ModName = STR("CyberRatsCoop");
-        ModVersion = STR("0.6.1");
-        ModDescription = STR("2-player shared-maze co-op (M4-M6, review-hardened, seed-sync)");
+        ModVersion = STR("0.6.2");
+        ModDescription = STR("2-player shared-maze co-op (M4-M6; puppet mesh follow fix)");
         ModAuthors = STR("CyberRatsCoop");
     }
     ~CyberRatsCoopMod() override = default;
@@ -163,6 +163,8 @@ public:
                 auto f = crc::packFrame(crc::Chan::PlayerState, crc::Msg::PlayerState, snap.encode());
                 m_transport->send(f.data(), f.size(), false, 1);
                 m_lastSend = t;
+                if ((m_txN++ % 20) == 0)
+                    Output::send<LogLevel::Default>(STR("[CRCoop] TX pos {} {} {} seq {}\n"), (int)snap.x, (int)snap.y, (int)snap.z, (int)snap.seq);
             }
         }
     }
@@ -189,8 +191,9 @@ private:
             break;
         case Msg::PlayerState: {
             auto ps = crc::PlayerStateMsg::decode(fr.body);
-            std::lock_guard<std::mutex> lk(m_mtx);
-            m_inRemote = ps; m_haveRemote = true;
+            { std::lock_guard<std::mutex> lk(m_mtx); m_inRemote = ps; m_haveRemote = true; }
+            if ((m_rxN++ % 20) == 0)
+                Output::send<LogLevel::Default>(STR("[CRCoop] RX pos {} {} {} seq {} fromPlayer {}\n"), (int)ps.x, (int)ps.y, (int)ps.z, (int)ps.seq, (int)ps.playerId);
             break;
         }
         case Msg::MazeSeed: {
@@ -372,6 +375,19 @@ private:
                 p->ProcessEvent(turnOff, nullptr);
                 Output::send<LogLevel::Default>(STR("[CRCoop] puppet neutralized (Turn Off Rat)\n"));
             }
+            stopActorAI(p);   // also destroy any auto-spawned AIController so it can't fight the transform
+            // CRITICAL for visible movement: if "Turn Off Rat" ragdolled the mesh (physics sim), the
+            // visible mesh decouples from the actor — the actor moves (and our net sync is correct) but
+            // the rat appears FROZEN where the ragdoll settled (the spawn). Stop physics so the mesh
+            // rigidly follows the driven actor transform.
+            if (auto** meshP = p->GetValuePtrByPropertyNameInChain<U::UObject*>(STR("Mesh"))) {
+                if (auto* mesh = *meshP) {
+                    if (auto* sp = mesh->GetFunctionByNameInChain(STR("SetSimulatePhysics"))) {
+                        bool bSim = false; mesh->ProcessEvent(sp, &bSim);
+                        Output::send<LogLevel::Default>(STR("[CRCoop] puppet mesh physics OFF (follow transform)\n"));
+                    }
+                }
+            }
         }
 
         // Drive the puppet transform from the latest remote snapshot (snap for now; interp in M2b).
@@ -379,6 +395,18 @@ private:
         U::FRotator rot(0.0, u16ToYaw(rem.yaw), 0.0);
         U::FHitResult hit{};
         ((U::AActor*)m_puppet)->K2_SetActorLocationAndRotation(loc, rot, false, hit, true);
+        if ((m_drvN++ % 20) == 0) {
+            U::FVector cur = ((U::AActor*)m_puppet)->K2_GetActorLocation();
+            Output::send<LogLevel::Default>(STR("[CRCoop] DRV puppet target {} {} {} -> actual {} {} {}\n"),
+                (int)rem.x, (int)rem.y, (int)rem.z, (int)cur.GetX(), (int)cur.GetY(), (int)cur.GetZ());
+        }
+        // Re-assert physics-off ~2x/s: "Turn Off Rat" can ragdoll the mesh a frame after spawn, which
+        // would freeze the visible rat in place while the actor (correctly) follows the net transform.
+        if ((m_drvN % 30) == 1) {
+            if (auto** mp = ((U::AActor*)m_puppet)->GetValuePtrByPropertyNameInChain<U::UObject*>(STR("Mesh")))
+                if (auto* mesh = *mp)
+                    if (auto* sp = mesh->GetFunctionByNameInChain(STR("SetSimulatePhysics"))) { bool b = false; mesh->ProcessEvent(sp, &b); }
+        }
 
         // M6 host-authoritative: the puppet mirrors the client's rat in the host's world (identical
         // maze), so if a host enemy kills the puppet, announce the client's death so the client
@@ -770,6 +798,7 @@ private:
     std::atomic<bool> m_peerReady{false};   // written on loop thread, read on game thread (#11)
     uint64_t m_lastSend = 0;
     uint16_t m_seq = 0;
+    int m_txN = 0, m_rxN = 0, m_drvN = 0, m_locN = 0;   // diagnostic throttle counters (M2 movement sync)
 
     // shared between net thread (on_update) and game thread (hook)
     std::mutex m_mtx;
