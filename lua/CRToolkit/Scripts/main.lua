@@ -582,6 +582,46 @@ pcall(function()
     end)
 end)
 
+-- TEST-HARNESS: ~9s nach dem Rat-Spawn die naechste Kaese per Interact() einsammeln. Das triggert
+-- exakt denselben Pfad wie das Hineinlaufen (BP_Cheese_Pickup_C:Interact -> C++-Pre-Hook -> Sync),
+-- ohne dass die Ratte beim blinden Erkunden in Fallen stirbt. Nur zum Validieren des M4-Kaese-Syncs.
+CONFIG.autoCollectCheese = false   -- test harness for M4 cheese-sync (off by default)
+CONFIG.autoCollectDelayMs = 9000
+local g_autoCollected = false
+local function autoCollectNearestCheese()
+    ExecuteInGameThread(function()
+        local pc = try(function() return UEHelpers.GetPlayerController() end)
+        local pawn = pc and (try(function() return pc.Pawn end) or try(function() return pc:K2_GetPawn() end))
+        if not valid(pawn) then log("AUTO-COLLECT: kein Pawn"); return end
+        local rl = try(function() return pawn:K2_GetActorLocation() end)
+        local _, arr = countOf("BP_Cheese_Pickup_C")
+        if not arr or not rl then log("AUTO-COLLECT: keine Kaese/Position"); return end
+        local best, bestD = nil, 1e18
+        pcall(function()
+            arr:ForEach(function(_, item)
+                local c = item:get()
+                local cl = try(function() return c:K2_GetActorLocation() end)
+                if cl then
+                    local dx, dy, dz = cl.X - rl.X, cl.Y - rl.Y, cl.Z - rl.Z
+                    local d = dx*dx + dy*dy + dz*dz
+                    if d < bestD then bestD = d; best = c end
+                end
+            end)
+        end)
+        if not valid(best) then log("AUTO-COLLECT: keine gueltige Kaese"); return end
+        log("AUTO-COLLECT: Interact auf naechster Kaese (dist^2=%.0f)", bestD)
+        pcall(function() best:Interact() end)
+    end)
+end
+pcall(function()
+    NotifyOnNewObject("/Game/Characters/Lab_Rat/BP_LabRat.BP_LabRat_C", function(Obj)
+        if CONFIG.autoCollectCheese and not g_autoCollected then
+            g_autoCollected = true
+            ExecuteWithDelay(CONFIG.autoCollectDelayMs, autoCollectNearestCheese)
+        end
+    end)
+end)
+
 -- PER-SPAWN: Kaese-Pickups beim ersten Spawn dumpen (bestaetigt `Interact` + Count-Mutation).
 pcall(function()
     NotifyOnNewObject("/Game/Interactions/Chese_Pickup.Chese_Pickup_C", function(Obj)

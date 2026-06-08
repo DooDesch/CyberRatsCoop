@@ -84,8 +84,8 @@ class CyberRatsCoopMod : public CppUserModBase {
 public:
     CyberRatsCoopMod() : CppUserModBase() {
         ModName = STR("CyberRatsCoop");
-        ModVersion = STR("0.6.0");
-        ModDescription = STR("2-player shared-maze co-op (M4 cheese, M5 enemies, M6 death)");
+        ModVersion = STR("0.6.1");
+        ModDescription = STR("2-player shared-maze co-op (M4-M6, review-hardened, seed-sync)");
         ModAuthors = STR("CyberRatsCoop");
     }
     ~CyberRatsCoopMod() override = default;
@@ -309,9 +309,22 @@ private:
         m_localPawn = rat;
         if (!m_killRatFn) m_killRatFn = rat->GetFunctionByNameInChain(STR("Kill Rat"));  // M6
 
-        // M6: keep the per-player death latch in sync with the rat's real state — reset on revive (#9).
+        // M6: poll "Is Dead" — robustly detects the local rat's death from ANY cause (traps bypass
+        // the "Kill Rat" fn, so the hook alone misses them). Reset the latch on revive. Deduped via
+        // m_ratDead so this and the Kill Rat hook never double-broadcast.
         if (auto* deadP = rat->GetValuePtrByPropertyNameInChain<bool>(STR("Is Dead"))) {
-            if (!*deadP) m_ratDead[m_playerId] = false;
+            if (*deadP) {
+                if (!m_ratDead[m_playerId] && !m_applyingRemoteDeath) {
+                    m_ratDead[m_playerId] = true;
+                    U::FVector l = rat->K2_GetActorLocation();
+                    crc::DeathMsg d; d.playerId = m_playerId; d.cause = 1; d.killerEnemyId = 0;
+                    d.x = (float)l.GetX(); d.y = (float)l.GetY(); d.z = (float)l.GetZ();
+                    queueOut(crc::packFrame(crc::Chan::Control, crc::Msg::Death, d.encode()), true);
+                    Output::send<LogLevel::Default>(STR("[CRCoop] local rat died (Is Dead) -> broadcast\n"));
+                }
+            } else {
+                m_ratDead[m_playerId] = false;
+            }
         }
         // M6: apply a host-authoritative death the peer announced for our rat (game thread).
         if (m_pendingApplyOwnDeath) {
@@ -366,6 +379,24 @@ private:
         U::FRotator rot(0.0, u16ToYaw(rem.yaw), 0.0);
         U::FHitResult hit{};
         ((U::AActor*)m_puppet)->K2_SetActorLocationAndRotation(loc, rot, false, hit, true);
+
+        // M6 host-authoritative: the puppet mirrors the client's rat in the host's world (identical
+        // maze), so if a host enemy kills the puppet, announce the client's death so the client
+        // applies it (the client has no live enemies of its own).
+        if (m_role == crc::Role::Host) {
+            uint8_t cid = (uint8_t)(1 - m_playerId);
+            if (cid <= 1 && !m_ratDead[cid]) {
+                if (auto* pd = ((U::AActor*)m_puppet)->GetValuePtrByPropertyNameInChain<bool>(STR("Is Dead"))) {
+                    if (*pd) {
+                        m_ratDead[cid] = true;
+                        crc::DeathMsg d; d.playerId = cid; d.cause = 2; d.killerEnemyId = 0;
+                        d.x = (float)loc.GetX(); d.y = (float)loc.GetY(); d.z = (float)loc.GetZ();
+                        queueOut(crc::packFrame(crc::Chan::Control, crc::Msg::Death, d.encode()), true);
+                        Output::send<LogLevel::Default>(STR("[CRCoop] client puppet died on host -> broadcast death\n"));
+                    }
+                }
+            }
+        }
     }
 
     // Pre-hook on Maze_Generator:ReceiveBeginPlay — runs BEFORE generation. Force the shared seed
@@ -395,22 +426,32 @@ private:
         m_ratDead[0] = m_ratDead[1] = false;  // M6: new run, both rats alive again
         m_pendingApplyOwnDeath = false;
         if (genWorld) m_curWorld = genWorld;
-        int32_t seed = m_forceSeed;
-        { std::lock_guard<std::mutex> lk(m_mtx); if (m_haveNetSeed) seed = (int32_t)m_netSeed; }
-        if (seed < 0) { Output::send<LogLevel::Default>(STR("[CRCoop] maze gen (seed not forced)\n")); return; }
+        // Seed-sync. The "Random Seed Roll" Int on the GameInstance is what the generator seeds from.
+        bool haveNet = false; uint32_t netSeed = 0;
+        { std::lock_guard<std::mutex> lk(m_mtx); haveNet = m_haveNetSeed; netSeed = (uint32_t)m_netSeed; }
         auto* gi = U::UObjectGlobals::FindFirstOf(STR("GameInstance_LabRats_C"));
-        if (gi) {
-            if (auto* p = gi->GetValuePtrByPropertyName<int32_t>(STR("Random Seed Roll"))) {
-                *p = seed;
-                Output::send<LogLevel::Default>(STR("[CRCoop] forced maze seed = {}\n"), seed);
-            } else {
-                Output::send<LogLevel::Error>(STR("[CRCoop] 'Random Seed Roll' prop not found\n"));
+        int32_t* seedProp = gi ? gi->GetValuePtrByPropertyName<int32_t>(STR("Random Seed Roll")) : nullptr;
+        if (!seedProp) { Output::send<LogLevel::Error>(STR("[CRCoop] 'Random Seed Roll' prop not found\n")); return; }
+
+        if (m_role == crc::Role::Host) {
+            // Host is authoritative: a config force_seed overrides; otherwise broadcast the natural
+            // game-rolled seed. The client mirrors it so both build the identical maze in production
+            // (no manual force_seed needed on both sides).
+            int32_t seed = (m_forceSeed >= 0) ? m_forceSeed : *seedProp;
+            if (m_forceSeed >= 0) *seedProp = seed;
+            if (m_peerReady && seed >= 0) {
+                crc::MazeSeedMsg ms; ms.seed = (uint64_t)(uint32_t)seed; ms.genMode = 0;
+                queueOut(crc::packFrame(crc::Chan::Control, crc::Msg::MazeSeed, ms.encode()), true);
             }
-        }
-        // Host shares its seed with the client (reliable; queued -> sent on the loop thread).
-        if (m_role == crc::Role::Host && m_peerReady) {
-            crc::MazeSeedMsg ms; ms.seed = (uint64_t)(uint32_t)seed; ms.genMode = 0;
-            queueOut(crc::packFrame(crc::Chan::Control, crc::Msg::MazeSeed, ms.encode()), true);
+            Output::send<LogLevel::Default>(STR("[CRCoop] host maze seed = {} (shared)\n"), seed);
+        } else if (m_role == crc::Role::Client) {
+            // Client mirrors the host's seed (preferred); falls back to a config force_seed.
+            int32_t seed = haveNet ? (int32_t)netSeed : m_forceSeed;
+            if (seed >= 0) { *seedProp = seed; Output::send<LogLevel::Default>(STR("[CRCoop] client maze seed = {} (net={})\n"), seed, haveNet ? 1 : 0); }
+            else Output::send<LogLevel::Default>(STR("[CRCoop] client maze: no shared seed yet (natural)\n"));
+        } else if (m_forceSeed >= 0) {
+            *seedProp = m_forceSeed;
+            Output::send<LogLevel::Default>(STR("[CRCoop] forced maze seed = {}\n"), m_forceSeed);
         }
     }
 
@@ -565,6 +606,7 @@ private:
                     sp.x = (float)l.GetX(); sp.y = (float)l.GetY(); sp.z = (float)l.GetZ();
                     sp.yaw = yawToU16(r.GetYaw()); sp.spawnerId = 0;
                     queueOut(crc::packFrame(crc::Chan::Control, crc::Msg::EnemySpawn, sp.encode()), true);
+                    Output::send<LogLevel::Default>(STR("[CRCoop] host enemy {} (arch {}) -> broadcast spawn\n"), (int)id, (int)a);
                 } else {
                     id = it->second;
                 }
@@ -659,6 +701,7 @@ private:
             if (!p) continue;
             neutralizeEnemyPuppet(p);   // visible, but no collision/AI; transform-driven
             m_enemyPuppet[sp.enemyId] = p; m_puppetSet.insert(p);
+            Output::send<LogLevel::Default>(STR("[CRCoop] client spawned enemy puppet id {} (arch {})\n"), (int)sp.enemyId, (int)sp.archetype);
         }
         if (!deferred.empty()) {
             std::lock_guard<std::mutex> lk(m_mtx);
