@@ -83,8 +83,8 @@ class CyberRatsCoopMod : public CppUserModBase {
 public:
     CyberRatsCoopMod() : CppUserModBase() {
         ModName = STR("CyberRatsCoop");
-        ModVersion = STR("0.5.0");
-        ModDescription = STR("2-player shared-maze co-op (M4 cheese + M5 host-auth enemies)");
+        ModVersion = STR("0.6.0");
+        ModDescription = STR("2-player shared-maze co-op (M4 cheese, M5 enemies, M6 death)");
         ModAuthors = STR("CyberRatsCoop");
     }
     ~CyberRatsCoopMod() override = default;
@@ -224,6 +224,11 @@ private:
             m_inEnemyDespawn.push_back(m.enemyId);
             break;
         }
+        case Msg::Death: {   // peer's rat died (M6: awareness; downed/revive is a later tested pass)
+            auto d = crc::DeathMsg::decode(fr.body);
+            Output::send<LogLevel::Default>(STR("[CRCoop] peer rat {} died\n"), (int)d.playerId);
+            break;
+        }
         default: break;
         }
     }
@@ -239,6 +244,8 @@ private:
             onCheeseInteract(cheese, cheese ? cheese->GetWorld() : nullptr);
             return;
         }
+        // M6: local rat death.
+        if (m_killRatFn && fn == m_killRatFn) { onRatKilled(U::Cast<U::AActor>(ctx)); return; }
 
         // Lazily resolve target classes.
         if (!m_labRatClass)
@@ -291,6 +298,7 @@ private:
         bool isLocal = ctrl && *ctrl;
         if (!isLocal) return;
         m_localPawn = rat;
+        if (!m_killRatFn) m_killRatFn = rat->GetFunctionByNameInChain(STR("Kill Rat"));  // M6
 
         // Read local transform -> outbound snapshot.
         U::FVector loc = rat->K2_GetActorLocation();
@@ -345,6 +353,7 @@ private:
         { std::lock_guard<std::mutex> lk(m_mtx); m_pendingReplay.clear(); }
         m_enemyPollCtr = 0;
         resetEnemies();   // fresh enemy ids/puppets for the new maze
+        m_localRatDead = false;  // M6: new run, rat alive again
         int32_t seed = m_forceSeed;
         { std::lock_guard<std::mutex> lk(m_mtx); if (m_haveNetSeed) seed = (int32_t)m_netSeed; }
         if (seed < 0) { Output::send<LogLevel::Default>(STR("[CRCoop] maze gen (seed not forced)\n")); return; }
@@ -600,6 +609,19 @@ private:
         // m_archetypeClass cache persists across mazes (classes don't change).
     }
 
+    // ---- M6 death detection (game thread) ---------------------------------
+    void onRatKilled(U::AActor* rat) {
+        if (!rat || rat == (U::AActor*)m_puppet) return;  // ignore the peer's puppet
+        if (m_localRatDead) return;
+        m_localRatDead = true;
+        U::FVector l = rat->K2_GetActorLocation();
+        crc::DeathMsg d;
+        d.playerId = m_playerId; d.cause = 0; d.killerEnemyId = 0;
+        d.x = (float)l.GetX(); d.y = (float)l.GetY(); d.z = (float)l.GetZ();
+        queueOut(crc::packFrame(crc::Chan::Control, crc::Msg::Death, d.encode()), true);
+        Output::send<LogLevel::Default>(STR("[CRCoop] local rat died -> broadcast death\n"));
+    }
+
     int cfgIntOpt(const char* cliKey, const wchar_t* envKey, const char* sec, const char* key, int def) {
         std::string v = optValue(cliKey, envKey);
         if (!v.empty()) { try { return std::stoi(v); } catch (...) {} }
@@ -666,6 +688,12 @@ private:
     std::vector<crc::EnemySpawnMsg> m_inEnemySpawn;
     crc::EnemyStateMsg m_inEnemyState; bool m_haveEnemyState = false;
     std::vector<uint16_t> m_inEnemyDespawn;
+
+    // ---- M6 death (minimal): detect local rat death + broadcast. The full co-op downed/revive
+    // mechanic needs a blocking hook on "Kill Rat" (the global ProcessEvent pre-cb is observe-only)
+    // plus host-authoritative damage, so it's deferred to a tested pass.
+    U::UFunction* m_killRatFn = nullptr;
+    bool m_localRatDead = false;
 
     void queueOut(std::vector<uint8_t>&& frame, bool reliable) {
         std::lock_guard<std::mutex> lk(m_outMtx);
