@@ -83,8 +83,8 @@ class CyberRatsCoopMod : public CppUserModBase {
 public:
     CyberRatsCoopMod() : CppUserModBase() {
         ModName = STR("CyberRatsCoop");
-        ModVersion = STR("0.4.0");
-        ModDescription = STR("2-player shared-maze co-op (M4: cheese/objective sync)");
+        ModVersion = STR("0.5.0");
+        ModDescription = STR("2-player shared-maze co-op (M4 cheese + M5 host-auth enemies)");
         ModAuthors = STR("CyberRatsCoop");
     }
     ~CyberRatsCoopMod() override = default;
@@ -206,6 +206,24 @@ private:
             m_pendingReplay.push_back(m.pickupId);
             break;
         }
+        case Msg::EnemySpawn: {   // host -> client (client spawns a puppet)
+            auto m = crc::EnemySpawnMsg::decode(fr.body);
+            std::lock_guard<std::mutex> lk(m_mtx);
+            m_inEnemySpawn.push_back(m);
+            break;
+        }
+        case Msg::EnemyState: {   // host -> client (latest wins)
+            auto m = crc::EnemyStateMsg::decode(fr.body);
+            std::lock_guard<std::mutex> lk(m_mtx);
+            m_inEnemyState = m; m_haveEnemyState = true;
+            break;
+        }
+        case Msg::EnemyDespawn: {
+            auto m = crc::EnemyDespawnMsg::decode(fr.body);
+            std::lock_guard<std::mutex> lk(m_mtx);
+            m_inEnemyDespawn.push_back(m.enemyId);
+            break;
+        }
         default: break;
         }
     }
@@ -253,6 +271,15 @@ private:
             }
             // Apply any peer cheese-collects (game thread).
             drainPickupReplays(world);
+
+            // M5 enemies (host-authoritative). Client snaps puppets every tick; both poll ~10 Hz.
+            if (m_role == crc::Role::Client) drainEnemyEvents(world);
+            if (world && ++m_enemyPollCtr >= 6) {
+                m_enemyPollCtr = 0;
+                if (m_role == crc::Role::Host)        hostEnemyPoll(world);
+                else if (m_role == crc::Role::Client) clientEnemyNeutralize(world);
+            }
+
             if (!m_fpLogged && m_mazeGenFrames > 120) { logMazeFingerprint(); m_fpLogged = true; }
         }
 
@@ -316,6 +343,8 @@ private:
         m_cheeseRegistryBuilt = false;
         m_cheeseById.clear(); m_cheeseIdOf.clear(); m_cheeseProcessed.clear();
         { std::lock_guard<std::mutex> lk(m_mtx); m_pendingReplay.clear(); }
+        m_enemyPollCtr = 0;
+        resetEnemies();   // fresh enemy ids/puppets for the new maze
         int32_t seed = m_forceSeed;
         { std::lock_guard<std::mutex> lk(m_mtx); if (m_haveNetSeed) seed = (int32_t)m_netSeed; }
         if (seed < 0) { Output::send<LogLevel::Default>(STR("[CRCoop] maze gen (seed not forced)\n")); return; }
@@ -429,6 +458,148 @@ private:
         }
     }
 
+    // ---- M5 enemies (all game-thread) -------------------------------------
+    static const wchar_t* enemyName(uint8_t a) {
+        switch (a) {
+            case 0: return STR("BP_Canister_Rat_C");
+            case 1: return STR("BP_SmokeBomb_Rat_C");
+            case 2: return STR("BP_SpiderRat_C");
+            case 3: return STR("BP_Rat_Critter_C");
+            case 4: return STR("BP_DAVE_C");
+            case 5: return STR("BP_TeamRat_C");
+            default: return STR("");
+        }
+    }
+
+    void neutralizeActor(U::AActor* a, bool hide) {
+        if (!a) return;
+        a->SetActorEnableCollision(false);   // no overlap damage to the local rat
+        a->SetActorTickEnabled(false);       // stop the BP AI ubergraph (Random Roam / chase)
+        if (hide) a->SetActorHiddenInGame(true);
+    }
+
+    // HOST: enumerate live enemies, assign monotonic ids, broadcast spawn (reliable) + state (unrel)
+    // + despawn (reliable). Called at ~10 Hz.
+    void hostEnemyPoll(U::UWorld* world) {
+        std::set<U::AActor*> current;
+        crc::EnemyStateMsg st;
+        for (uint8_t a = 0; a < 6; ++a) {
+            std::vector<U::UObject*> found;
+            U::UObjectGlobals::FindAllOf(enemyName(a), found);
+            for (auto* o : found) {
+                auto* e = U::Cast<U::AActor>(o);
+                if (!e) continue;
+                current.insert(e);
+                uint16_t id;
+                auto it = m_enemyIdOf.find(e);
+                if (it == m_enemyIdOf.end()) {
+                    id = m_nextEnemyId++;
+                    m_enemyIdOf[e] = id; m_enemyById[id] = e; m_enemyArch[id] = a;
+                    U::FVector l = e->K2_GetActorLocation();
+                    U::FRotator r = e->K2_GetActorRotation();
+                    crc::EnemySpawnMsg sp;
+                    sp.enemyId = id; sp.archetype = a;
+                    sp.x = (float)l.GetX(); sp.y = (float)l.GetY(); sp.z = (float)l.GetZ();
+                    sp.yaw = yawToU16(r.GetYaw()); sp.spawnerId = 0;
+                    queueOut(crc::packFrame(crc::Chan::Control, crc::Msg::EnemySpawn, sp.encode()), true);
+                } else {
+                    id = it->second;
+                }
+                U::FVector l = e->K2_GetActorLocation();
+                U::FRotator r = e->K2_GetActorRotation();
+                crc::EnemyStateMsg::Entry en{};
+                en.enemyId = id;
+                en.x = (float)l.GetX(); en.y = (float)l.GetY(); en.z = (float)l.GetZ();
+                en.yaw = yawToU16(r.GetYaw()); en.anim = 0; en.flags = 0; en.hp = 100;
+                st.entries.push_back(en);
+            }
+        }
+        // Despawn ids whose actor disappeared.
+        std::vector<uint16_t> gone;
+        for (auto& kv : m_enemyById) if (!current.count(kv.second)) gone.push_back(kv.first);
+        for (uint16_t id : gone) {
+            crc::EnemyDespawnMsg dm; dm.enemyId = id; dm.reason = 0;
+            queueOut(crc::packFrame(crc::Chan::Control, crc::Msg::EnemyDespawn, dm.encode()), true);
+            auto* a = m_enemyById[id];
+            m_enemyIdOf.erase(a); m_enemyById.erase(id); m_enemyArch.erase(id);
+        }
+        if (!st.entries.empty())
+            queueOut(crc::packFrame(crc::Chan::WorldState, crc::Msg::EnemyState, st.encode()), false);
+    }
+
+    // CLIENT: hide its own AI-spawned enemies (host drives puppets instead). Also caches each
+    // archetype's UClass from a live instance so puppets can be spawned.
+    void clientEnemyNeutralize(U::UWorld* world) {
+        for (uint8_t a = 0; a < 6; ++a) {
+            std::vector<U::UObject*> found;
+            U::UObjectGlobals::FindAllOf(enemyName(a), found);
+            for (auto* o : found) {
+                auto* e = U::Cast<U::AActor>(o);
+                if (!e) continue;
+                if (!m_archetypeClass[a]) m_archetypeClass[a] = e->GetClassPrivate();
+                if (m_puppetSet.count(e)) continue;          // my own puppet
+                if (m_neutralizedLocal.count(e)) continue;   // already hidden
+                neutralizeActor(e, true);
+                m_neutralizedLocal.insert(e);
+            }
+        }
+    }
+
+    // CLIENT: apply host enemy events on the game thread — spawn/drive/destroy puppets.
+    void drainEnemyEvents(U::UWorld* world) {
+        std::vector<crc::EnemySpawnMsg> spawns;
+        std::vector<uint16_t> despawns;
+        crc::EnemyStateMsg state; bool haveState = false;
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            spawns.swap(m_inEnemySpawn);
+            despawns.swap(m_inEnemyDespawn);
+            if (m_haveEnemyState) { state = m_inEnemyState; haveState = true; m_haveEnemyState = false; }
+        }
+        std::vector<crc::EnemySpawnMsg> deferred;
+        for (auto& sp : spawns) {
+            if (m_enemyPuppet.count(sp.enemyId)) continue;
+            U::UClass* cls = (sp.archetype < 6) ? m_archetypeClass[sp.archetype] : nullptr;
+            if (!cls || !world) { deferred.push_back(sp); continue; } // class not cached yet -> retry
+            U::FVector loc((double)sp.x, (double)sp.y, (double)sp.z);
+            U::FRotator rot(0.0, u16ToYaw(sp.yaw), 0.0);
+            U::AActor* p = world->SpawnActor(cls, &loc, &rot);
+            if (!p) continue;
+            neutralizeActor(p, false);   // visible, but no collision/AI; transform-driven
+            m_enemyPuppet[sp.enemyId] = p; m_puppetSet.insert(p);
+        }
+        if (!deferred.empty()) {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            for (auto& s : deferred) m_inEnemySpawn.push_back(s);
+        }
+        if (haveState) {
+            for (auto& en : state.entries) {
+                auto it = m_enemyPuppet.find(en.enemyId);
+                if (it == m_enemyPuppet.end() || !it->second) continue;
+                U::FVector loc((double)en.x, (double)en.y, (double)en.z);
+                U::FRotator rot(0.0, u16ToYaw(en.yaw), 0.0);
+                U::FHitResult hit{};
+                it->second->K2_SetActorLocationAndRotation(loc, rot, false, hit, true);
+            }
+        }
+        for (uint16_t id : despawns) {
+            auto it = m_enemyPuppet.find(id);
+            if (it != m_enemyPuppet.end()) {
+                if (it->second) { m_puppetSet.erase(it->second); it->second->K2_DestroyActor(); }
+                m_enemyPuppet.erase(it);
+            }
+        }
+    }
+
+    void resetEnemies() {
+        m_enemyIdOf.clear(); m_enemyById.clear(); m_enemyArch.clear(); m_nextEnemyId = 1;
+        for (auto& kv : m_enemyPuppet) if (kv.second) kv.second->K2_DestroyActor();
+        m_enemyPuppet.clear(); m_puppetSet.clear(); m_neutralizedLocal.clear();
+        std::lock_guard<std::mutex> lk(m_mtx);
+        m_inEnemySpawn.clear(); m_inEnemyDespawn.clear(); m_haveEnemyState = false;
+        // m_archetypeClass cache persists across mazes (classes don't change).
+    }
+
     int cfgIntOpt(const char* cliKey, const wchar_t* envKey, const char* sec, const char* key, int def) {
         std::string v = optValue(cliKey, envKey);
         if (!v.empty()) { try { return std::stoi(v); } catch (...) {} }
@@ -476,6 +647,25 @@ private:
     std::vector<uint16_t> m_pendingReplay;                 // peer collects to replay (guard: m_mtx)
     bool m_cheeseRegistryBuilt = false;
     bool m_replayingInteract = false;                      // re-entrancy guard for replayed Interact
+
+    // ---- M5 host-authoritative enemies ------------------------------------
+    // Enemies are AI-driven (Random Roam, chase, NavMesh MoveTo) -> non-deterministic across peers.
+    // Host owns them: assigns a monotonic id per enemy, broadcasts EnemySpawn/State/Despawn. Client
+    // hides its OWN (locally AI-spawned) enemies and shows host-driven puppets (collision + tick
+    // disabled, transform snapped from EnemyState). Archetype byte = index into kEnemyNames.
+    U::UClass* m_archetypeClass[6] = {};                    // UClass per archetype (cached from instance)
+    std::unordered_map<U::AActor*, uint16_t> m_enemyIdOf;   // host: actor -> id
+    std::unordered_map<uint16_t, U::AActor*> m_enemyById;   // host: id -> actor
+    std::unordered_map<uint16_t, uint8_t>   m_enemyArch;    // host: id -> archetype
+    uint16_t m_nextEnemyId = 1;
+    std::unordered_map<uint16_t, U::AActor*> m_enemyPuppet; // client: id -> puppet actor
+    std::set<U::AActor*> m_puppetSet;                       // client: actors I spawned (skip neutralize)
+    std::set<U::AActor*> m_neutralizedLocal;               // client: local AI enemies already hidden
+    int m_enemyPollCtr = 0;
+    // incoming enemy events (loop thread -> game thread; guarded by m_mtx)
+    std::vector<crc::EnemySpawnMsg> m_inEnemySpawn;
+    crc::EnemyStateMsg m_inEnemyState; bool m_haveEnemyState = false;
+    std::vector<uint16_t> m_inEnemyDespawn;
 
     void queueOut(std::vector<uint8_t>&& frame, bool reliable) {
         std::lock_guard<std::mutex> lk(m_outMtx);
