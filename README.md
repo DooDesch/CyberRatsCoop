@@ -1,5 +1,8 @@
 # Cyber Rats Co-op
 
+> 🛟 **Need help or found a bug?** Get support at [support.doodesch.de](https://support.doodesch.de).
+
+
 A 2-player shared-maze **co-op multiplayer mod** for **Cyber Rats** (Outpost Games, Steam App
 `3565080`), an Unreal Engine 5.6 single-player roguelite. The game ships with no networking
 (`OnlineSubsystemNull`, no NetDriver) and no anti-cheat, so this mod adds co-op as an **external
