@@ -1,6 +1,6 @@
 # Cyber Rats Co-op
 
-> 🛟 **Need help or found a bug?** Get support at [support.doodesch.de](https://support.doodesch.de).
+> 🛟 **Need help or found a bug?** Get support at [support.doodesch.de/cyberratscoop](https://support.doodesch.de/cyberratscoop).
 
 
 A 2-player shared-maze **co-op multiplayer mod** for **Cyber Rats** (Outpost Games, Steam App
